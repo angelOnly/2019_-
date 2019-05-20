@@ -30,7 +30,7 @@ class ModelConfig(object):
 
 class Config(object):
     embeddingSize = 200
-    sequenceLength = 1500  # 取了所有序列长度的均值
+    sequenceLength = 300  # 取了所有序列长度的均值
     batchSize = 128
 
     dataSource = "../data/preProcess/labeledTrain.csv"
@@ -55,13 +55,13 @@ class Transformer(object):
     def __init__(self, config, wordEmbedding):
 
         # 定义模型的输入
-        # [?, 1500]
+        # [?, 300]
         self.inputX = tf.placeholder(tf.int32, [None, config.sequenceLength], name="inputX")
-        # [?, 1]
-        self.inputY = tf.placeholder(tf.float32, [None, 1], name="inputY")
+        # [?, 3]
+        self.inputY = tf.placeholder(tf.float32, [None, 3], name="inputY")
 
         self.dropoutKeepProb = tf.placeholder(tf.float32, name="dropoutKeepProb")
-        # [?, 1500, 200]
+        # [?, 300, 200]
         #         self.embeddedPosition = tf.placeholder(tf.float32, [None, config.sequenceLength, config.embeddingSize], name="embeddedPosition")
 
         self.config = config
@@ -128,21 +128,28 @@ class Transformer(object):
 
         # 全连接层的输出
         with tf.name_scope("output"):
-            outputW = tf.get_variable(
-                "outputW",
-                shape=[outputSize, 1],
-                initializer=tf.contrib.layers.xavier_initializer())
-
-            outputB = tf.Variable(tf.constant(0.1, shape=[1]), name="outputB")
+            outputW = self.weight_variable([outputSize, 3], name='outputW')
+            outputB = self.bias_variable([3], name='outputB')
             l2Loss += tf.nn.l2_loss(outputW)
             l2Loss += tf.nn.l2_loss(outputB)
-            self.predictions = tf.nn.xw_plus_b(outputs, outputW, outputB, name="predictions")
-            self.binaryPreds = tf.cast(tf.greater_equal(self.predictions, 0.5), tf.float32, name="binaryPreds")
+            self.scores = tf.nn.xw_plus_b(outputs, outputW, outputB, name="predictions")
+            self.predictions = tf.argmax(self.scores, 1, name="predictions")
+            # self.binaryPreds = tf.cast(tf.greater_equal(self.predictions, 0.5), tf.float32, name="binaryPreds")
 
         # 计算二元交叉熵损失
         with tf.name_scope("loss"):
-            losses = tf.nn.sigmoid_cross_entropy_with_logits(logits=self.predictions, labels=self.inputY)
+            losses = tf.nn.softmax_cross_entropy_with_logits(logits=self.scores, labels=self.inputY)
             self.loss = tf.reduce_mean(losses) + config.model.l2RegLambda * l2Loss
+
+    def weight_variable(self, shape, name):
+        """Create a weight variable with appropriate initialization."""
+        initial = tf.truncated_normal(shape, stddev=0.1)
+        return tf.Variable(initial, name=name)
+
+    def bias_variable(self, shape, name):
+        """Create a bias variable with appropriate initialization."""
+        initial = tf.constant(0.1, shape=shape)
+        return tf.Variable(initial, name=name)
 
     def _layerNormalization(self, inputs, scope="layerNorm"):
         # LayerNorm层和BN层有所不同
@@ -313,17 +320,31 @@ def mean(item):
     return sum(item) / len(item)
 
 
-def genMetrics(trueY, predY, binaryPredY):
+def genMetrics(trueY, predY):
     """
     生成acc和auc值
     """
-    auc = roc_auc_score(trueY, predY)
-    accuracy = accuracy_score(trueY, binaryPredY)
-    precision = precision_score(trueY, binaryPredY)
-    recall = recall_score(trueY, binaryPredY)
+    accuracy = accuracy_score(trueY, predY)
+    precision = precision_score(trueY, predY)
+    recall = recall_score(trueY, predY)
+    f1 = (2 * precision * recall) / (precision + recall)
 
-    return round(accuracy, 4), round(auc, 4), round(precision, 4), round(recall, 4)
+    return round(accuracy, 4), round(precision, 4), round(recall, 4), round(f1, 4)
 
+def load_data_and_labels(data_path, use_pinyin=False):
+    y = []
+    x_text = []
+    with open(data_path, 'r', encoding= 'utf-8') as f:
+        for line in f:
+            data = line.strip().split('\t')
+#             print(data[-1])
+            lable = int(float(data[-1]))
+            one_hot = [0]*3
+            one_hot[lable-1] = 1
+            y.append(np.array(one_hot))
+            x_text.append(data[:300])
+    print("data load finished")
+    return [x_text, np.array(y)]
 
 # 输出batch数据集
 def nextBatch(x, y, batchSize):
@@ -333,8 +354,15 @@ def nextBatch(x, y, batchSize):
 
     perm = np.arange(len(x))
     np.random.shuffle(perm)
-    x = x[perm]
-    y = y[perm]
+    i = 0
+    if i == 0:
+        print('perm:', perm)
+        i = 1
+    # x = x[perm]
+    # y = y[perm]
+
+    x = np.array(x)[perm]
+    y = np.array(y)[perm]
 
     numBatches = len(x) // batchSize
 
@@ -343,24 +371,22 @@ def nextBatch(x, y, batchSize):
         end = start + batchSize
         batchX = np.array(x[start: end], dtype="int64")
         batchY = np.array(y[start: end], dtype="float32")
-
         yield batchX, batchY
 
 # 训练模型
-#
 # 生成训练集和验证集
-df_train = pd.read_csv("../output/train_num.csv", sep='\t')
-df_eval = pd.read_csv("../output/eval_num.csv", sep='\t')
-df_train_label = pd.read_csv("../output/train_labels.csv", sep='\t')
-df_eval_label = pd.read_csv("../output/eval_labels.csv", sep='\t')
 word_embedding = pd.read_csv("../output/word_embedding.csv", sep='\t')
 
-trainReviews = np.asarray(df_train)
-trainLabels = np.asarray(df_train_label)
-evalReviews = np.asarray(df_eval)
-evalLabels = np.asarray(df_eval_label)
+train_data_path = "../output/train_and_label.csv"
+eval_data_path = "../output/eval_and_label.csv"
+
+trainReviews, trainLabels = load_data_and_labels(train_data_path)
+evalReviews, evalLabels = load_data_and_labels(eval_data_path)
 
 wordEmbedding = np.asarray(word_embedding)
+
+
+print(wordEmbedding.shape)
 
 # 实例化配置参数对象
 config = Config()
@@ -421,40 +447,40 @@ with tf.Graph().as_default():
                 transformer.inputY: batchY,
                 transformer.dropoutKeepProb: config.model.dropoutKeepProb
             }
-            _, summary, step, loss, predictions, binaryPreds = sess.run(
-                [trainOp, summaryOp, globalStep, transformer.loss, transformer.predictions, transformer.binaryPreds],
+            _, summary, step, loss, predictions = sess.run(
+                [trainOp, summaryOp, globalStep, transformer.loss, transformer.predictions],
                 feed_dict)
             timeStr = datetime.datetime.now().isoformat()
-            acc, es = []
             accs = []
-            aucs = []
             precisions = []
             recalls = []
+            f1s = []
             losses = []
 
             for batchEval in nextBatch(evalReviews, evalLabels, config.batchSize):
-                loss, acc, auc, precision, recall = devStep(batchEval[0], batchEval[1])
+                loss, acc, precision, recall, f1 = devStep(batchEval[0], batchEval[1])
                 losses.append(loss)
                 accs.append(acc)
-                aucs.append(auc)
                 precisions.append(precision)
                 recalls.append(recall)
+                f1s.append(f1)
 
             time_str = datetime.datetime.now().isoformat()
             print("{}, step: {}, loss: {}, acc: {}, auc: {}, precision: {}, recall: {}".format(time_str, currentStep,
                                                                                                mean(losses),
-                                                                                               mean(accs), mean(aucs),
+                                                                                               mean(accs),
                                                                                                mean(precisions),
-                                                                                               mean(recalls)))
+                                                                                               mean(recalls),
+                                                                                               mean(f1s)))
 
             if currentStep % config.training.checkpointEvery == 0:
                 # 保存模型的另一种方法，保存checkpoint文件
                 path = saver.save(sess, "../model/Transformer/model/my-model", global_step=currentStep)
                 print("Saved model checkpoint to {}\n".format(path))
 
-            auc, precision, recall = genMetrics(batchY, predictions, binaryPreds)
-            print("{}, step: {}, loss: {}, acc: {}, auc: {}, precision: {}, recall: {}".format(timeStr, step, loss, acc,
-                                                                                               auc, precision, recall))
+            acc, precision, recall, f1 = genMetrics(batchY, predictions)
+            print("{}, step: {}, loss: {}, acc: {}, precision: {}, recall: {}, f1: {}".format(timeStr, step, loss, acc,
+                                                                                               precision, recall, f1))
             trainSummaryWriter.add_summary(summary, step)
 
 
@@ -467,21 +493,23 @@ with tf.Graph().as_default():
             transformer.inputY: batchY,
             transformer.dropoutKeepProb: 1.0
         }
-        summary, step, loss, predictions, binaryPreds = sess.run(
-            [summaryOp, globalStep, transformer.loss, transformer.predictions, transformer.binaryPreds],
+        summary, step, loss, predictions = sess.run(
+            [summaryOp, globalStep, transformer.loss, transformer.predictions],
             feed_dict)
 
-        acc, auc, precision, recall = genMetrics(batchY, predictions, binaryPreds)
+        acc, precision, recall, f1 = genMetrics(batchY, predictions)
 
         evalSummaryWriter.add_summary(summary, step)
 
-        return loss, acc, auc, precision, recall
+        return loss, acc, precision, recall, f1
 
 
     for i in range(config.training.epoches):
         # 训练模型
         print("start training model")
         for batchTrain in nextBatch(trainReviews, trainLabels, config.batchSize):
+            if i==0:
+                print(batchTrain[0], '--', batchTrain[1])
             trainStep(batchTrain[0], batchTrain[1])
 
             currentStep = tf.train.global_step(sess, globalStep)
@@ -501,4 +529,3 @@ with tf.Graph().as_default():
                                              legacy_init_op=legacy_init_op)
 
         builder.save()
-
